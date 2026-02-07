@@ -1,0 +1,150 @@
+# ============================================
+# GitLab CI/CD Pipeline
+# Second Project DevOps - Kubernetes Edition
+# ============================================
+
+stages:
+  - lint
+  - build
+  - test
+  - scan
+  - deploy
+
+variables:
+  DOCKER_IMAGE: $CI_REGISTRY_IMAGE
+  DOCKER_TAG: $CI_COMMIT_SHORT_SHA
+  NODE_VERSION: "22"
+
+# ---- Cache npm pour accélérer les jobs ----
+.node_cache: &node_cache
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}-node
+    paths:
+      - node_modules/
+
+# ============================================
+# Stage 1: LINT - Vérification de la qualité
+# ============================================
+lint:dockerfile:
+  stage: lint
+  image: hadolint/hadolint:latest-alpine
+  script:
+    - hadolint Dockerfile --no-fail || true
+  allow_failure: true
+
+lint:yaml:
+  stage: lint
+  image: python:3.12-alpine
+  script:
+    - pip install yamllint --quiet
+    - yamllint docker-compose.yaml k8s/ || true
+  allow_failure: true
+
+# ============================================
+# Stage 2: BUILD - Construction de l'image
+# ============================================
+build:docker:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - echo "🔨 Building Docker image..."
+    - docker build -t $DOCKER_IMAGE:$DOCKER_TAG -t $DOCKER_IMAGE:latest .
+    - echo "📦 Pushing to GitLab Container Registry..."
+    - docker push $DOCKER_IMAGE:$DOCKER_TAG
+    - docker push $DOCKER_IMAGE:latest
+  only:
+    - main
+    - merge_requests
+
+# ============================================
+# Stage 3: TEST - Tests applicatifs
+# ============================================
+test:unit:
+  stage: test
+  image: node:${NODE_VERSION}-alpine
+  <<: *node_cache
+  before_script:
+    - npm ci
+  script:
+    - echo "🧪 Running unit tests..."
+    - npm test
+  only:
+    - main
+    - merge_requests
+
+test:container:
+  stage: test
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - echo "🐳 Testing container health..."
+    - docker pull $DOCKER_IMAGE:$DOCKER_TAG
+    - docker run -d --name test-container -p 3000:3000 $DOCKER_IMAGE:$DOCKER_TAG
+    - sleep 5
+    - docker exec test-container wget --no-verbose --tries=3 --spider http://localhost:3000/health
+    - echo "✅ Container health check passed!"
+  after_script:
+    - docker stop test-container || true
+    - docker rm test-container || true
+  needs:
+    - build:docker
+  only:
+    - main
+
+# ============================================
+# Stage 4: SCAN - Sécurité
+# ============================================
+scan:trivy:
+  stage: scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  variables:
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+  script:
+    - echo "🔒 Scanning image for vulnerabilities..."
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL --no-progress $DOCKER_IMAGE:$DOCKER_TAG
+  needs:
+    - build:docker
+  allow_failure: true
+  only:
+    - main
+
+# ============================================
+# Stage 5: DEPLOY - Déploiement Kubernetes
+# ============================================
+deploy:staging:
+  stage: deploy
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  before_script:
+    - echo "⚙️ Configuring kubectl..."
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+  script:
+    - echo "🚀 Deploying to Kubernetes..."
+    - kubectl set image deployment/second-project-devops app=$DOCKER_IMAGE:$DOCKER_TAG -n devops --record || kubectl apply -f k8s/ -n devops
+    - kubectl rollout status deployment/second-project-devops -n devops --timeout=120s
+    - echo "✅ Deployment successful!"
+  environment:
+    name: staging
+    url: http://second-project-devops.local
+  needs:
+    - test:container
+    - scan:trivy
+  only:
+    - main
+  when: manual
